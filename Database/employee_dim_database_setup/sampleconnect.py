@@ -15,4 +15,3 @@ l = cur.fetchall()
 print([column[1] for column in l])  # Print column names
 #cur.execute("SELECT * from hrms_employee")
 #print(cur.fetchall())
-def execute_sql(query, DB_Name):
