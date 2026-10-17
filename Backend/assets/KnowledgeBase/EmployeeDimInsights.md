@@ -19,12 +19,10 @@ more rows than people. **Counting it unfiltered overstates headcount.**
 ```sql
 -- correct
 SELECT COUNT(*) FROM dim_employee WHERE is_current = 1;
--- or, preferred
-SELECT COUNT(*) FROM v_dim_employee_current;
 ```
 
-Use the view `v_dim_employee_current` by default. Query history only when the question is
-explicitly about change over time.
+`WHERE is_current = 1` belongs in every query by default. Query history only when the
+question is explicitly about change over time.
 
 ### Rule 2 — "active" means `is_active = 1`, not `employment_status = 'ACTIVE'`
 
@@ -77,8 +75,8 @@ SELECT bill_currency,
        COUNT(*)      AS contractors,
        MIN(bill_rate) AS min_rate,
        MAX(bill_rate) AS max_rate
-FROM v_dim_employee_current
-WHERE in_beeline = 1 AND bill_rate IS NOT NULL
+FROM dim_employee
+WHERE is_current = 1 AND in_beeline = 1 AND bill_rate IS NOT NULL
 GROUP BY bill_currency;
 ```
 
@@ -179,7 +177,6 @@ For "how many people come from source X", use the **flags**, not string matching
 | `effective_from` / `effective_to` | Validity window; current rows end `9999-12-31 23:59:59` |
 | `is_current` | 1 for the live version |
 | `scd_signature` | Internal change detector — never expose to users |
-| `etl_run_id`, `dw_insert_ts`, `dw_update_ts` | Load audit |
 
 First-ever versions start at `1900-01-01 00:00:00` so history has no gap. That is a sentinel,
 not a real date — **never report it as a start date**.
@@ -191,72 +188,72 @@ not a real date — **never report it as a start date**.
 ```sql
 -- Total active people
 SELECT COUNT(*) AS active_people
-FROM v_dim_employee_current WHERE is_active = 1;
+FROM dim_employee WHERE is_current = 1 AND is_active = 1;
 
 -- Headcount split by worker type
 SELECT worker_type,
        COUNT(*)                                   AS total,
        SUM(is_active)                             AS active,
        COUNT(*) - SUM(is_active)                  AS inactive
-FROM v_dim_employee_current
+FROM dim_employee WHERE is_current = 1
 GROUP BY worker_type ORDER BY total DESC;
 
 -- Active employees by department
 SELECT department_code, department_name, COUNT(*) AS active_employees
-FROM v_dim_employee_current
-WHERE is_active = 1 AND worker_type = 'EMPLOYEE'
+FROM dim_employee
+WHERE is_current = 1 AND is_active = 1 AND worker_type = 'EMPLOYEE'
 GROUP BY department_code, department_name ORDER BY active_employees DESC;
 
 -- People per source system
 SELECT SUM(in_hrms) AS from_hrms, SUM(in_beeline) AS from_beeline,
        SUM(in_smarttime) AS from_smarttime, COUNT(*) AS total_people
-FROM v_dim_employee_current;
+FROM dim_employee WHERE is_current = 1;
 
 -- People in more than one source
 SELECT source_systems, COUNT(*) AS people
-FROM v_dim_employee_current
+FROM dim_employee WHERE is_current = 1
 GROUP BY source_systems ORDER BY people DESC;
 
 -- Employment status breakdown
 SELECT employment_status, COUNT(*) AS people
-FROM v_dim_employee_current
+FROM dim_employee WHERE is_current = 1
 GROUP BY employment_status ORDER BY people DESC;
 
 -- Contractor rates by currency (never summed — see §2)
 SELECT bill_currency, COUNT(*) AS contractors,
        MIN(bill_rate) AS min_rate, MAX(bill_rate) AS max_rate
-FROM v_dim_employee_current
-WHERE in_beeline = 1 AND bill_rate IS NOT NULL
+FROM dim_employee
+WHERE is_current = 1 AND in_beeline = 1 AND bill_rate IS NOT NULL
 GROUP BY bill_currency;
 
 -- Contractors rolling off in the next 90 days
 SELECT full_name, supplier_name, assignment_end_date
-FROM v_dim_employee_current
-WHERE is_active = 1 AND assignment_end_date IS NOT NULL
+FROM dim_employee
+WHERE is_current = 1 AND is_active = 1 AND assignment_end_date IS NOT NULL
   AND assignment_end_date <= date('now','+90 day')
 ORDER BY assignment_end_date;
 
 -- Tenure of active employees (years)
 SELECT full_name, hire_date,
        ROUND((julianday('now') - julianday(hire_date)) / 365.25, 1) AS years
-FROM v_dim_employee_current
-WHERE is_active = 1 AND in_hrms = 1
+FROM dim_employee
+WHERE is_current = 1 AND is_active = 1 AND in_hrms = 1
 ORDER BY hire_date;
 
 -- Badge coverage
 SELECT SUM(in_smarttime) AS with_badge,
        COUNT(*) - SUM(in_smarttime) AS without_badge
-FROM v_dim_employee_current WHERE is_active = 1;
+FROM dim_employee WHERE is_current = 1 AND is_active = 1;
 
 -- Security: leavers with an enabled badge
 SELECT full_name, employment_status, smarttime_badge_id, last_punch_ts
-FROM v_dim_employee_current
-WHERE dq_flags LIKE '%INACTIVE_WITH_ENABLED_BADGE%';
+FROM dim_employee
+WHERE is_current = 1 AND dq_flags LIKE '%INACTIVE_WITH_ENABLED_BADGE%';
 
 -- Any data-quality flag
 SELECT dq_flags, COUNT(*) AS people
-FROM v_dim_employee_current
-WHERE dq_flags IS NOT NULL GROUP BY dq_flags ORDER BY people DESC;
+FROM dim_employee
+WHERE is_current = 1 AND dq_flags IS NOT NULL GROUP BY dq_flags ORDER BY people DESC;
 
 -- Headcount as it stood on a past date (point-in-time)
 SELECT COUNT(*) AS active_people
@@ -269,11 +266,11 @@ SELECT full_name, job_title, job_grade, employment_status,
        effective_from, effective_to, is_current
 FROM dim_employee WHERE employee_bk = :email ORDER BY effective_from;
 
--- Who changed in the last run
-SELECT full_name, job_title, employment_status, dw_insert_ts
+-- Who changed in the most recent load
+SELECT full_name, job_title, employment_status, effective_from
 FROM dim_employee
-WHERE is_current = 1 AND etl_run_id = (SELECT MAX(etl_run_id) FROM dim_employee)
-  AND effective_from <> '1900-01-01 00:00:00';
+WHERE is_current = 1
+  AND effective_from = (SELECT MAX(effective_from) FROM dim_employee);
 ```
 
 **Point-in-time pattern:** for "as of" questions, replace `is_current = 1` with
@@ -286,7 +283,7 @@ never double-counts.
 
 | # | Pitfall | Correct approach |
 |---|---|---|
-| 1 | Counting `dim_employee` without `is_current` | Use `v_dim_employee_current` |
+| 1 | Counting `dim_employee` without `is_current` | Add `WHERE is_current = 1` |
 | 2 | `COUNT(DISTINCT employee_sk)` as headcount | Use `COUNT(DISTINCT employee_bk)` |
 | 3 | Treating `employment_status = 'ACTIVE'` as all active | Use `is_active = 1` (includes `ON_LEAVE`) |
 | 4 | Summing `bill_rate` | Never — mixed currency and mixed unit; no salary exists (§2) |

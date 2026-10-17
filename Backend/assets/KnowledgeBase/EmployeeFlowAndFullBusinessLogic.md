@@ -14,14 +14,16 @@ layer that explains it.
 
 ## 1. Physical layout
 
-SQLite stores one database per file. All paths are relative to the project root.
+SQLite stores one database per file. All paths are relative to the project root. The
+pipeline is exactly ten tables: 3 source, 3 stage, 3 intrm, 1 target. There are no views,
+no run-control table and no reject table.
 
 | Logical DB | File | Layer | Tables |
 |---|---|---|---|
 | DB1 | `db/db1_hrms.db` | Source — HRMS | `hrms_employee` |
 | DB2 | `db/db2_beeline.db` | Source — Beeline | `beeline_worker` |
 | DB3 | `db/db3_smarttime.db` | Source — SmartTime | `st_employee` |
-| DB4 | `db/db4_analytics.db` | Stage + Intrm + Target | `stg_*` (3), `intrm_*` (3), `intrm_reject`, `vw_smarttime_resolved`, `dim_employee`, `v_dim_employee_current`, `etl_run` |
+| DB4 | `db/db4_analytics.db` | Stage + Intrm + Target | `stg_*` (3), `intrm_*` (3), `dim_employee` |
 
 To query across them, attach the sources to DB4:
 
@@ -54,14 +56,14 @@ DB3 st_employee     → stg_smarttime_employee → intrm_smarttime_employee ┘
 
 | # | Step | Script | Notes |
 |---|---|---|---|
-| 1 | Source → stage ×3 | `sql/03_source_queries/*.sql` (+ `stage_load_attach.sql`) | Truncate + reload, no transformation |
+| 1 | Source → stage ×3 | `sql/03_source_queries/*.sql` | Truncate + reload, no transformation |
 | 2a | Stage → intrm HRMS | `sql/04_intrm/intrm_hrms_employee.sql` | Must run first |
 | 2b | Stage → intrm Beeline | `sql/04_intrm/intrm_beeline_worker.sql` | Must run second |
 | 2c | Stage → intrm SmartTime | `sql/04_intrm/intrm_smarttime_employee.sql` | **Must run last** — reads 2a and 2b to resolve identity |
 | 3 | Intrm → target | `sql/05_target/dim_employee_load.sql` | SCD2 merge |
 
 **Order dependency matters for debugging.** If 2c ran before 2a/2b, SmartTime badges without
-an email could not be resolved and would land in `intrm_reject` instead of the dimension.
+an email could not be resolved and would be dropped instead of reaching the dimension.
 
 ### Load patterns per layer
 
@@ -76,20 +78,23 @@ history. This is the single most common source of confusion: if the pipeline has
 a source change, stage/intrm/target all still show the *old* value and the source shows the
 *new* one — that is correct behaviour, not a defect.
 
-### Run control
+### Run timestamp
 
-`etl_run` has one row per run: `run_id`, `run_ts` (the logical as-of time used for SCD2
-effective dates) and `status` (`STARTED` → `STAGED` → `INTRM_DONE` → `TARGET_DONE`).
+There is **no run-control table and no audit column anywhere**. The logical as-of time used
+for SCD2 effective dates is passed into the target load by the caller: `setup_all.py` creates
+`temp.run_ctx (run_ts, is_first_load)` on its connection, and
+`sql/05_target/dim_employee_load.sql` reads `run_ts` from it. The replay supplies the weekly
+date it is simulating, which is what lets a year of history be rebuilt from scratch.
 
-Every stage, intrm, reject and dim row carries the `etl_run_id` that produced it.
+**Debug implication:** nothing records when a row was loaded or by which run. The only
+timestamp left in the warehouse is the SCD2 window, so "when did the pipeline last change
+anything?" is answered with:
 
 ```sql
--- when did the pipeline last complete?
-SELECT * FROM etl_run ORDER BY run_id DESC LIMIT 5;
+SELECT MAX(effective_from) AS last_change FROM dim_employee;
 ```
 
-A run whose status is not `TARGET_DONE` did not finish; anything the business analyst sees
-from that run is partial.
+A run that changed nothing leaves no trace at all.
 
 ---
 
@@ -105,15 +110,16 @@ emp_key = LOWER(TRIM(email))
 - It is the join key that merges the three sources into one person.
 - It becomes `dim_employee.employee_bk` (the business key) unchanged.
 
-**SmartTime is the exception.** Its email is optional, so `vw_smarttime_resolved` resolves
-`emp_key` in strict priority order and records which rule won in `key_resolution`:
+**SmartTime is the exception.** Its email is optional, so the `resolved` CTE inside
+`sql/04_intrm/intrm_smarttime_employee.sql` resolves `emp_key` in strict priority order and
+records which rule won in `key_resolution`:
 
 | Priority | Rule | `key_resolution` |
 |---|---|---|
 | 1 | The badge's own email | `SOURCE_EMAIL` |
 | 2 | `emp_code` matched `intrm_hrms_employee.hrms_employee_number` | `HRMS_EMP_CODE` |
 | 3 | `emp_code` matched `intrm_beeline_worker.beeline_worker_id` | `BEELINE_WORKER_ID` |
-| — | None matched → `emp_key` is NULL → row is **rejected** | — |
+| — | None matched → `emp_key` is NULL → row is **dropped** | — |
 
 Consequences the agent must know:
 
@@ -200,15 +206,8 @@ Natural key `badge_id`. One row per badge; **one person can hold several badges.
 filtering. Garbage is preserved deliberately so it can be traced.
 
 Column mapping is **1:1 and same-named** for all three sources, except SmartTime's
-`is_enabled`, which is cast to TEXT on the way in.
-
-Three audit columns are added:
-
-| Column | Meaning |
-|---|---|
-| `etl_run_id` | Which run loaded the row |
-| `src_system` | `HRMS` / `BEELINE` / `SMARTTIME` |
-| `etl_load_ts` | When it landed |
+`is_enabled`, which is cast to TEXT on the way in. **No audit columns are added** — a stage
+table has exactly the columns the extract returns.
 
 **Debug implication:** if stage differs from source, either the pipeline has not run since the
 source changed, or the extract filter excluded the row. Nothing else can change a value here.
@@ -221,12 +220,13 @@ Purpose: clean, type, and reduce to **one row per person per source**.
 
 ### 6.1 `intrm_hrms_employee` — grain: one row per `hrms_employee_number`
 
-**Filter (rows failing this go to `intrm_reject`):**
+**Filter (rows failing it are dropped silently — nothing records them):**
 ```sql
 WHERE NULLIF(TRIM(employee_number),'') IS NOT NULL
   AND NULLIF(TRIM(work_email),'')      IS NOT NULL
 ```
-Reject reasons: `MISSING_EMPLOYEE_NUMBER`, `MISSING_EMAIL`.
+A row with no employee number or no work email cannot be tied to a person, so it never
+reaches intrm. Compare stage against intrm to find such rows.
 
 **Dedup:** `ROW_NUMBER() OVER (PARTITION BY hrms_employee_number ORDER BY src_updated_at DESC)`, keep `rn = 1`.
 → **the row with the latest `updated_at` wins; older versions are discarded.**
@@ -253,7 +253,8 @@ Reject reasons: `MISSING_EMPLOYEE_NUMBER`, `MISSING_EMAIL`.
 
 ### 6.2 `intrm_beeline_worker` — grain: one row per `emp_key`
 
-**Filter:** `WHERE NULLIF(TRIM(email_address),'') IS NOT NULL` → else reject `MISSING_EMAIL`.
+**Filter:** `WHERE NULLIF(TRIM(email_address),'') IS NOT NULL` → rows with no email are
+dropped (email is the identity key here).
 
 **Dedup:** `ROW_NUMBER() OVER (PARTITION BY email ORDER BY src_last_modified DESC)`, keep `rn = 1`.
 Note the partition is on **email**, not `worker_id` — if one person had two worker ids, only
@@ -280,10 +281,10 @@ the latest-modified assignment survives.
 
 ### 6.3 `intrm_smarttime_employee` — grain: one row per `emp_key`
 
-Built in two parts: the view `vw_smarttime_resolved` cleans and resolves identity, then the
-intrm script dedups.
+Built in one script with three CTEs: `cleaned` types the stage columns, `resolved` ties each
+badge to a person (§3), and `ranked` dedups.
 
-**Cleaning (in the view):**
+**Cleaning (in the `cleaned` CTE):**
 
 | Target column | Expression |
 |---|---|
@@ -298,13 +299,14 @@ intrm script dedups.
 | `last_punch_ts` | `DD-MM-YYYY HH:MM` → ISO datetime |
 | `is_badge_enabled` | `CAST(is_enabled AS INTEGER)` |
 | `src_modified_on` | `DD-MM-YYYY HH:MM` → ISO datetime |
-| `emp_key` | `COALESCE(src_email, h.emp_key, b.emp_key)` — see §3 |
+| `emp_key` | `COALESCE(src_email, h.emp_key, b.emp_key)` — in `resolved`, see §3 |
 | `key_resolution` | which rule won |
 
 **Names (in the intrm script):** `display_name` is split on the **first space** —
 `'LAKSHMI S'` → first `Lakshmi`, last `S`. A one-word display name yields a NULL last name.
 
-**Rejects:** `WHERE emp_key IS NULL` → `UNRESOLVED_IDENTITY (no email, emp_code not in HRMS/Beeline)`.
+**Dropped:** a badge with no email whose `emp_code` matches neither HRMS nor Beeline has
+`emp_key = NULL` and is filtered out by `WHERE emp_key IS NOT NULL`. Nothing records it.
 
 **Dedup — the badge-choice rule:**
 ```sql
@@ -314,16 +316,23 @@ ROW_NUMBER() OVER (PARTITION BY emp_key
 → **an enabled badge always beats a disabled one; ties break on latest `modified_on`.**
 This is why a converted contractor shows the new employee badge, not the old contractor one.
 
-### 6.4 `intrm_reject`
+### 6.4 Rows that never make it
 
-| Column | Meaning |
-|---|---|
-| `src_system` | Which source |
-| `src_record_id` | The natural key of the dropped row |
-| `reject_reason` | Why |
-| `etl_run_id`, `rejected_at` | When |
+There is no reject table. A row that fails a filter above is simply absent from intrm, so
+**a person missing from the dimension is found by comparing stage with intrm**:
 
-**A person missing from the dimension is very often here.** Always check it.
+```sql
+-- HRMS rows in stage that no intrm row corresponds to
+SELECT employee_number, work_email FROM stg_hrms_employee
+WHERE NULLIF(TRIM(employee_number),'') IS NULL
+   OR NULLIF(TRIM(work_email),'')      IS NULL;
+
+-- SmartTime badges that could not be resolved to a person
+SELECT badge_id, emp_code, email FROM stg_smarttime_employee
+WHERE NULLIF(TRIM(email),'') IS NULL
+  AND UPPER(TRIM(emp_code)) NOT IN (SELECT hrms_employee_number FROM intrm_hrms_employee)
+  AND UPPER(TRIM(emp_code)) NOT IN (SELECT beeline_worker_id    FROM intrm_beeline_worker);
+```
 
 ---
 
@@ -378,7 +387,6 @@ employees have no Beeline record. Confirm with `in_hrms` / `in_beeline` / `in_sm
 | `smarttime_badge_id` | The **winning** badge only (see §6.3) |
 | `in_hrms` / `in_beeline` / `in_smarttime` | 1/0 presence flags |
 | `source_systems` | Pipe-joined, e.g. `HRMS\|SMARTTIME` |
-| `etl_run_id`, `dw_insert_ts`, `dw_update_ts` | Audit |
 
 ### 7.5 Data-quality flags (`dq_flags`, pipe-delimited, NULL when clean)
 
@@ -446,14 +454,16 @@ SELECT * FROM src_hrms.hrms_employee      WHERE LOWER(TRIM(work_email))    = :em
 SELECT * FROM src_beeline.beeline_worker  WHERE LOWER(TRIM(email_address)) = :email;
 SELECT * FROM src_smarttime.st_employee   WHERE LOWER(TRIM(email))         = :email;
 
--- 4. was anything about them rejected?
-SELECT * FROM intrm_reject WHERE src_record_id IN (
-    SELECT hrms_employee_number FROM intrm_hrms_employee WHERE emp_key = :email
-    UNION SELECT beeline_worker_id FROM intrm_beeline_worker WHERE emp_key = :email);
-SELECT * FROM intrm_reject ORDER BY reject_id DESC LIMIT 20;
+-- 4. in stage but not in intrm? then a filter dropped them (§6.4)
+SELECT 'HRMS' AS src, employee_number AS id, work_email AS email FROM stg_hrms_employee
+ WHERE LOWER(TRIM(work_email)) = :email
+   AND (NULLIF(TRIM(employee_number),'') IS NULL OR NULLIF(TRIM(work_email),'') IS NULL)
+UNION ALL
+SELECT 'BEELINE', worker_id, email_address FROM stg_beeline_worker
+ WHERE NULLIF(TRIM(email_address),'') IS NULL;
 
--- 5. run context
-SELECT * FROM etl_run ORDER BY run_id DESC LIMIT 5;
+-- 5. when did the dimension last change? (no run-control table exists)
+SELECT MAX(effective_from) AS last_change FROM dim_employee;
 ```
 
 ### 8.2 Decision tree — "target value ≠ source value"
@@ -462,10 +472,10 @@ Work down in order; stop at the first match.
 
 | # | Check | If true → verdict |
 |---|---|---|
-| 1 | Does stage equal the source? | **No** → the pipeline has not run since the source changed (compare source row-version vs `etl_run.run_ts`), **or** the row was filtered out. **Not an ETL defect** — report as "source changed after last run". |
+| 1 | Does stage equal the source? | **No** → the pipeline has not run since the source changed (compare the source row's own timestamp with `MAX(effective_from)` in `dim_employee`), **or** the row was filtered out. **Not an ETL defect** — report as "source changed after last run". |
 | 2 | Does intrm equal stage for the *winning* row? | **No** → a transformation changed it. Find the column in §6 and quote the rule (decode, proper case, date format, `$`/`,` strip). **Correct by design.** |
 | 3 | Are there several stage rows for this person? | **Yes** → dedup picked one. HRMS: latest `updated_at`. Beeline: latest `last_modified` (ISO-converted). SmartTime: enabled badge, then latest `modified_on`. Confirm the winner is genuinely the latest. **Correct by design** unless the version timestamp itself is wrong in the source. |
-| 4 | Is the person missing from intrm but present in stage? | **Yes** → check `intrm_reject`. Missing email / missing employee number / unresolved badge. **Data-quality issue in the source.** |
+| 4 | Is the person missing from intrm but present in stage? | **Yes** → a filter dropped the row: missing email / missing employee number / unresolved badge. Confirm with the queries in §6.4. **Data-quality issue in the source.** |
 | 5 | Does the target's *current* row differ from intrm? | **Yes** → go to 6 and 7. |
 | 6 | Is the differing column in the `scd_signature` list (§7.6)? | **No** → the column does not trigger a version and is not Type 1, so it is stuck at the old value. **Known limitation.** |
 | 7 | Did another source win survivorship? | **Yes** → HRMS beats Beeline beats SmartTime (§7.1). E.g. job title comes from HRMS even though Beeline shows a different posting title. **Correct by design.** |
@@ -475,18 +485,20 @@ Work down in order; stop at the first match.
 
 ### 8.3 Freshness check — is the target simply stale?
 
+With no run-control table, the newest `effective_from` is the best available watermark. It
+is the last run that **changed something**, so it is a lower bound on the last run.
+
 ```sql
--- latest completed run
-SELECT MAX(run_ts) AS last_run FROM etl_run WHERE status = 'TARGET_DONE';
+-- last load that changed anything
+SELECT MAX(effective_from) AS last_change FROM dim_employee;
 
 -- HRMS rows changed after it (needs ATTACH)
 SELECT employee_number, work_email, updated_at
 FROM src_hrms.hrms_employee
-WHERE datetime(updated_at) >
-      (SELECT MAX(run_ts) FROM etl_run WHERE status = 'TARGET_DONE');
+WHERE datetime(updated_at) > (SELECT MAX(effective_from) FROM dim_employee);
 ```
-Any rows returned → the source moved after the last load. The target is *correct as of its
-run*, and the fix is to run the pipeline, not to change code.
+Any rows returned → the source moved after the last load that changed anything. The target is
+*correct as of its run*, and the fix is to run the pipeline, not to change code.
 
 ### 8.4 Integrity checks (all four must return zero rows)
 
@@ -508,7 +520,7 @@ If any returns rows, it **is** an ETL defect — escalate.
 | **Meera Pillai** (E1006) | SmartTime badge has no email | Present, flag `SMARTTIME_EMAIL_MISSING` | `emp_code` matched the HRMS number |
 | **Rahul Varma** (E1003) | Terminated, badge still enabled | `is_active = 0`, flag `INACTIVE_WITH_ENABLED_BADGE` | Leaver with live badge |
 | **Lakshmi S** (ST-0011) | Badge only | `worker_type = UNKNOWN`, `UNVERIFIED`, flag `TIMEKEEPING_ONLY` | In no HR or vendor system |
-| **Visitor badge** (ST-0012) | No email, `emp_code` matches nothing | **Absent** — in `intrm_reject` | Unresolved identity |
+| **Visitor badge** (ST-0012) | No email, `emp_code` matches nothing | **Absent** — dropped at intrm | Unresolved identity |
 | **Priya Nair** (E1002) | Promoted on a later run | Two rows; old expired, new current | Title + grade are in the signature |
 
 ### 8.6 Answer template for the agent
