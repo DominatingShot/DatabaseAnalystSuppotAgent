@@ -1,17 +1,14 @@
+#!/usr/bin/env python3
+"""Peek inside DB1: list its tables, then the columns of hrms_employee.
+
+    python sampleconnect.py
+"""
+import os
 import sqlite3
 
-conn = sqlite3.connect(r"C:\Users\aksha\Desktop\DataSupportAgent\Database\employee_dim_database_setup\db\db1_hrms.db")   # path to your .db file
-cur = conn.cursor()
+DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db", "db1_hrms.db")
 
-cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-print(cur.fetchall())
-
-# cur.execute("SELECT * from hrms_employee")
-# print(cur.fetchall())
-
-
-cur.execute("PRAGMA table_info(hrms_employee)")
-l = cur.fetchall()
-print([column[1] for column in l])  # Print column names
-#cur.execute("SELECT * from hrms_employee")
-#print(cur.fetchall())
+con = sqlite3.connect(DB)
+print(con.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall())
+print([c[1] for c in con.execute("PRAGMA table_info(hrms_employee)")])
+con.close()

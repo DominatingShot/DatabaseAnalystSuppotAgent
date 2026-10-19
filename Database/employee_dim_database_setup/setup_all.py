@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""
-Build the four databases and replay one year of weekly ETL runs.
+"""Build the four databases and replay one year of weekly ETL runs.
 
     python setup_all.py
 
-What it does, in order:
-    1. delete the old .db files
-    2. run every DDL in sql/01_ddl (3 source, 3 stage, 3 intrm, 1 target)
-    3. generate one year of mock source versions into db/_mock_master.db
-    4. for each of the 52 weekly run dates:
-         a. rebuild DB1/DB2/DB3 to their state on that date
-         b. source -> stage -> intrm x3 -> target (SCD2 merge)
-    5. run the validation checks and print the year-end headcount
-
-The run date is passed into the target load, which is what lets a year of SCD2
-history be rebuilt from scratch.
+The five steps it prints, and the point-in-time replay, are described in
+HOW_TO_RUN.md next to this file.
 """
 import datetime as dt
 import os
@@ -216,7 +206,6 @@ def main():
         print(f"  ok  {script}")
 
     print("\nSTEP 3  generate one year of source data")
-    sys.argv = ["generate_mock_year", "--no-sql"]
     gen.main()
 
     dates = run_dates()
